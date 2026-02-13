@@ -1,0 +1,1305 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Car Inspection App</title>
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <!-- Babel for JSX -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- PDF Generation -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <!-- OCR for VIN Scanning -->
+    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
+    <!-- Google Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+    <!-- Custom Styles -->
+    <link rel="stylesheet" href="./css/style.css">
+    <style>
+        .vehicle-blueprint-container {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            background: white;
+            position: relative;
+        }
+
+        .vehicle-blueprint-img {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+            pointer-events: none;
+        }
+    </style>
+</head>
+
+<body>
+    <div id="root"></div>
+
+    <!-- Main Logic Bundled for file:// Access -->
+    <script type="text/babel">
+        // --- 1. DB Service ---
+        const STORAGE_KEYS = {
+            INSPECTIONS: 'car_inspect_inspections',
+            USER: 'car_inspect_user'
+        };
+
+        const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+        const db = {
+            // Inspections
+            async getInspections() {
+                await delay(300);
+                const data = localStorage.getItem(STORAGE_KEYS.INSPECTIONS);
+                return data ? JSON.parse(data) : [];
+            },
+
+            async getInspectionByVin(vinFragment) {
+                await delay(300);
+                const all = await this.getInspections();
+                return all.filter(i => i.vehicleDetails.vin.endsWith(vinFragment));
+            },
+
+            async saveInspection(inspection) {
+                await delay(500);
+                const all = await this.getInspections();
+                const newInspection = {
+                    ...inspection,
+                    id: crypto.randomUUID(),
+                    createdAt: new Date().toISOString(),
+                    status: 'Assessment Complete'
+                };
+
+                all.unshift(newInspection);
+                localStorage.setItem(STORAGE_KEYS.INSPECTIONS, JSON.stringify(all));
+                return newInspection;
+            },
+
+            // Approvals
+            async createApprovalRequest(inspectionId, requestData) {
+                await delay(500);
+                const all = await this.getInspections();
+                const index = all.findIndex(i => i.id === inspectionId);
+                if (index === -1) throw new Error("Inspection not found");
+
+                all[index].approvalRequest = {
+                    ...requestData,
+                    status: 'Pending',
+                    requestedAt: new Date().toISOString()
+                };
+
+                localStorage.setItem(STORAGE_KEYS.INSPECTIONS, JSON.stringify(all));
+                return all[index];
+            },
+
+            // External APIs
+            async decodeVin(vin) {
+                try {
+                    const response = await fetch(`https://vpic.nhtsa.dot.gov/api/vehicles/decodevinvalues/${vin}?format=json`);
+                    const data = await response.json();
+                    const results = data.Results[0];
+
+                    if (results && results.Make) {
+                        return {
+                            year: results.ModelYear,
+                            make: results.Make,
+                            model: results.Model,
+                            bodyClass: results.BodyClass,
+                            success: true
+                        };
+                    }
+                    return { success: false, error: 'Could not decode VIN' };
+                } catch (e) {
+                    console.error("VIN Decode error:", e);
+                    return { success: false, error: e.message };
+                }
+            }
+        };
+
+        // --- 2. PDF Service ---
+        const generateInspectionPDF = async (inspection) => {
+            if (!window.jspdf || !window.html2canvas) {
+                alert("PDF Libraries not loaded");
+                return;
+            }
+
+            // Capture Visual Map first if available
+            let mapImage = null;
+            const mapElement = document.getElementById('visual-damage-map-capture');
+            if (mapElement) {
+                try {
+                    // Force wait a tiny bit to ensure markers are painted
+                    await new Promise(r => setTimeout(r, 150));
+
+                    // Optimized capture for damage map
+                    // allowTaint: true helps with file:// local images
+                    const canvas = await window.html2canvas(mapElement, {
+                        scale: 3,
+                        useCORS: false,
+                        allowTaint: true,
+                        backgroundColor: '#ffffff',
+                        logging: false,
+                        width: mapElement.offsetWidth,
+                        height: mapElement.offsetHeight
+                    });
+                    mapImage = canvas.toDataURL('image/jpeg', 0.9);
+                } catch (e) {
+                    console.error("Map capture failed", e);
+                }
+            }
+
+            const { jsPDF } = window.jspdf;
+            const doc = new jsPDF();
+            const { vehicleDetails, condition, damages, photos, notes, createdAt } = inspection;
+
+            // Header
+            doc.setFontSize(22);
+            doc.text("Vehicle Inspection Report", 20, 20);
+            doc.setFontSize(10);
+            doc.text(`Date: ${new Date(createdAt).toLocaleString()}`, 20, 30);
+            doc.text(`Inspection ID: ${inspection.id.slice(0, 8)}`, 150, 30);
+
+            // Section: Vehicle Info
+            doc.setFontSize(16);
+            doc.text("Vehicle Information", 20, 45);
+            doc.setLineWidth(0.5);
+            doc.line(20, 47, 190, 47);
+
+            doc.setFontSize(11);
+            let y = 55;
+            const addField = (label, value, x) => {
+                doc.setFont("helvetica", "bold");
+                doc.text(`${label}:`, x, y);
+                doc.setFont("helvetica", "normal");
+                if (value && value.length > 25) {
+                    doc.setFontSize(9);
+                    doc.text(value ? String(value) : "N/A", x + 35, y);
+                    doc.setFontSize(11);
+                } else {
+                    doc.text(value ? String(value) : "N/A", x + 35, y);
+                }
+            };
+
+            addField("VIN", vehicleDetails.vin, 20);
+            addField("Unit #", vehicleDetails.unitC, 110);
+            y += 10;
+            addField("Year", vehicleDetails.year, 20);
+            addField("Make", vehicleDetails.make, 110);
+            y += 10;
+            addField("Model", vehicleDetails.model, 20);
+            addField("Color", vehicleDetails.color, 110);
+            y += 10;
+            addField("Mileage", vehicleDetails.mileage, 20);
+            addField("Gas Level", vehicleDetails.gasLevel, 110);
+            y += 10;
+            addField("Date", new Date(createdAt).toLocaleDateString(), 20);
+            addField("Checked By", vehicleDetails.checkedInBy, 110);
+
+            // Section: Condition
+            y += 20;
+            doc.setFontSize(16);
+            doc.text("Condition Report", 20, y);
+            doc.line(20, y + 2, 190, y + 2);
+
+            y += 10;
+            doc.setFontSize(11);
+
+            const conditions = Object.entries(condition);
+            conditions.forEach((item, index) => {
+                if (index > 0 && index % 2 === 0) y += 10;
+                const x = (index % 2 === 0) ? 20 : 110;
+
+                const label = item[0].replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase());
+                const status = item[1] ? "Pass" : "FAIL";
+
+                doc.text(`${label}:`, x, y);
+                doc.setTextColor(item[1] ? 0 : 200, item[1] ? 100 : 0, 0);
+                doc.text(status, x + 50, y);
+                doc.setTextColor(0, 0, 0);
+            });
+
+            // Section: Tire Depth
+            y += 20;
+            if (y > 250) { doc.addPage(); y = 20; }
+            doc.setFontSize(16);
+            doc.text("Tire Depth (32nds)", 20, y);
+            doc.line(20, y + 2, 190, y + 2);
+            y += 10;
+            doc.setFontSize(11);
+            const td = inspection.tireDepth || {};
+            doc.text(`Front Left: ${td.fl || '-'}`, 20, y);
+            doc.text(`Front Right: ${td.fr || '-'}`, 110, y);
+            y += 8;
+            doc.text(`Rear Left: ${td.rl || '-'}`, 20, y);
+            doc.text(`Rear Right: ${td.rr || '-'}`, 110, y);
+
+            // Section: Visual Map
+            y += 15;
+            if (y > 250) { doc.addPage(); y = 20; }
+
+            doc.setFontSize(16);
+            doc.text("Visual Damage Map", 20, y);
+            doc.line(20, y + 2, 190, y + 2);
+            y += 10;
+
+            if (mapImage) {
+                const pdfWidth = 170;
+                const pdfHeight = (mapElement.offsetHeight / mapElement.offsetWidth) * pdfWidth;
+                doc.addImage(mapImage, 'JPEG', 20, y, pdfWidth, Math.min(pdfHeight, 100));
+                y += Math.min(pdfHeight, 100) + 10;
+            } else {
+                doc.setFontSize(10);
+                doc.setTextColor(150);
+                doc.text("(Map not available in PDF)", 20, y + 10);
+                y += 20;
+                doc.setTextColor(0);
+            }
+
+            // Section: Damage Text
+            if (y > 250) { doc.addPage(); y = 20; }
+            doc.setFontSize(16);
+            doc.text("Damage List", 20, y);
+            doc.line(20, y + 2, 190, y + 2);
+            y += 10;
+
+            if (!damages || damages.length === 0) {
+                doc.setFontSize(11);
+                doc.text("No damage reported.", 20, y);
+                y += 10;
+            } else {
+                damages.forEach((d, i) => {
+                    doc.setFontSize(11);
+                    doc.text(`${i + 1}. ${d.type} ${d.coords ? '(' + d.coords.view + ')' : ''} - ${d.notes}`, 20, y);
+                    y += 10;
+                });
+            }
+
+            // Section: Photos
+            if (photos && photos.length > 0) {
+                if (y > 200) { doc.addPage(); y = 20; }
+                else { y += 10; }
+
+                doc.setFontSize(16);
+                doc.text("Damage Photos", 20, y);
+                doc.line(20, y + 2, 190, y + 2);
+                y += 15;
+
+                photos.forEach((p, i) => {
+                    if (y > 250) { doc.addPage(); y = 20; }
+
+                    try {
+                        // Assuming p.url is Base64 data URI
+                        if (p.url && p.url.startsWith('data:image')) {
+                            // Scale image to fit width of ~80mm
+                            const imgProps = doc.getImageProperties(p.url);
+                            const imgWidth = 80;
+                            const imgHeight = (imgProps.height * imgWidth) / imgProps.width;
+                            // Default format undefined to let jsPDF detect
+                            const x = (i % 2 === 0) ? 20 : 110;
+
+                            if (i > 0 && i % 2 === 0) y += 70; // unexpected jump if images tall? simplified.
+
+                            doc.addImage(p.url, undefined, x, y, imgWidth, imgHeight);
+                            doc.setFontSize(9);
+                            doc.text(`Photo ${i + 1}: ${p.name}`, x, y + imgHeight + 5);
+
+                            if (i % 2 === 1) y += (Math.max(imgHeight, 60) + 15);
+                        }
+                    } catch (err) {
+                        console.error("Error adding photo to PDF", err);
+                    }
+                });
+
+                // Ensure y is pushed down if last row was odd
+                if (photos.length % 2 !== 0) y += 90;
+            }
+
+            // Notes
+            if (y > 250) { doc.addPage(); y = 20; }
+            y += 10;
+            if (notes) {
+                doc.setFontSize(12);
+                doc.text("Additional Notes:", 20, y);
+                y += 7;
+                doc.setFontSize(10);
+                const splitNotes = doc.splitTextToSize(notes, 170);
+                doc.text(splitNotes, 20, y);
+            }
+
+            // Footer
+            doc.save(`inspection-${vehicleDetails.vin || 'report'}.pdf`);
+        };
+
+        // --- 3. React Components ---
+        const { useState, useEffect } = React;
+
+        const VinScanner = ({ onScan, onClose }) => {
+            const [videoStream, setVideoStream] = useState(null);
+            const [scanning, setScanning] = useState(false);
+            const [error, setError] = useState(null);
+            const videoRef = React.useRef(null);
+            const canvasRef = React.useRef(null);
+
+            useEffect(() => {
+                startCamera();
+                return () => stopCamera();
+            }, []);
+
+            const startCamera = async () => {
+                setError(null);
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    setError("Security Error: Camera access requires HTTPS or localhost. If you are opening the file directly (file://), the scanner will not work in most browsers.");
+                    return;
+                }
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({
+                        video: {
+                            facingMode: 'environment',
+                            width: { ideal: 1920 },
+                            height: { ideal: 1080 }
+                        }
+                    });
+                    setVideoStream(stream);
+                    if (videoRef.current) {
+                        videoRef.current.srcObject = stream;
+                    }
+                } catch (err) {
+                    console.error("Camera Error:", err);
+                    setError(`Camera Error: ${err.message}. Please ensure permissions are granted.`);
+                }
+            };
+
+            const stopCamera = () => {
+                if (videoStream) {
+                    videoStream.getTracks().forEach(track => track.stop());
+                }
+            };
+
+            const captureAndScan = async () => {
+                if (!videoRef.current || !canvasRef.current || scanning) return;
+
+                setScanning(true);
+                const video = videoRef.current;
+                const canvas = canvasRef.current;
+
+                // Set canvas size to video dimensions
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                const ctx = canvas.getContext('2d');
+
+                // Draw current frame
+                ctx.drawImage(video, 0, 0);
+
+                // Apply image processing for better OCR
+                // We focus on the middle area defined by the overlay
+                const cropWidth = canvas.width * 0.8;
+                const cropHeight = canvas.height * 0.2;
+                const cropX = (canvas.width - cropWidth) / 2;
+                const cropY = (canvas.height - cropHeight) / 2;
+
+                const processedCanvas = document.createElement('canvas');
+                processedCanvas.width = cropWidth;
+                processedCanvas.height = cropHeight;
+                const pCtx = processedCanvas.getContext('2d');
+
+                // Filter and draw cropped area
+                pCtx.filter = 'contrast(180%) grayscale(100%) brightness(120%)';
+                pCtx.drawImage(canvas, cropX, cropY, cropWidth, cropHeight, 0, 0, cropWidth, cropHeight);
+
+                try {
+                    const { data: { text } } = await Tesseract.recognize(processedCanvas, 'eng');
+                    console.log("OCR Result RAW:", text);
+
+                    // Clean text and try to find VIN
+                    // Common OCR mistakes: I/1, O/0, Q/0
+                    const cleanText = text.replace(/[\s\n]/g, '').toUpperCase();
+
+                    // Slightly more flexible regex to catch common mistakes
+                    const vinRegex = /[A-Z0-9]{17}/g;
+                    const matches = cleanText.match(vinRegex);
+
+                    if (matches && matches.length > 0) {
+                        const detectedVin = matches[0];
+                        // Validate VIN (Basic)
+                        if (detectedVin.match(/^[A-HJ-NPR-Z0-9]{17}$/)) {
+                            onScan(detectedVin);
+                        } else {
+                            // If it has I, O, or Q, it's likely an OCR error
+                            const correctedVin = detectedVin.replace(/I/g, '1').replace(/[OQ]/g, '0');
+                            onScan(correctedVin);
+                        }
+                    } else {
+                        alert("No clean VIN detected. Make sure the 17 characters are flat, well-lit, and inside the green box.");
+                    }
+                } catch (err) {
+                    console.error("OCR ERROR:", err);
+                    alert(`Scanning failed: ${err.message}`);
+                } finally {
+                    setScanning(false);
+                }
+            };
+
+            return (
+                <div style={{
+                    position: 'fixed', top: 0, left: 0, right: 0, bottom: 0,
+                    background: 'rgba(0,0,0,0.9)', zIndex: 9999,
+                    display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '1rem'
+                }}>
+                    <div style={{ position: 'relative', width: '100%', maxWidth: '500px', background: '#000', borderRadius: '12px', overflow: 'hidden' }}>
+                        <video ref={videoRef} autoPlay playsInline style={{ width: '100%', display: 'block' }} />
+                        <canvas ref={canvasRef} style={{ display: 'none' }} />
+
+                        {/* Target Overlay */}
+                        <div style={{
+                            position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
+                            width: '80%', height: '60px', border: '2px solid var(--success)', borderRadius: '4px',
+                            boxShadow: '0 0 0 1000px rgba(0,0,0,0.5)'
+                        }} />
+                    </div>
+
+                    <div style={{ marginTop: '2rem', display: 'flex', gap: '1rem' }}>
+                        <button className="btn btn-primary" onClick={captureAndScan} disabled={scanning} style={{ width: 'auto', padding: '0.8rem 2rem' }}>
+                            {scanning ? 'Processing...' : 'Capture & Scan VIN'}
+                        </button>
+                        <button className="btn btn-outline" onClick={onClose} style={{ width: 'auto', background: 'white' }}>Cancel</button>
+                    </div>
+                    {error && <p style={{ color: 'white', marginTop: '1rem' }}>{error}</p>}
+                    <p style={{ color: '#ccc', fontSize: '0.8rem', marginTop: '1rem', textAlign: 'center' }}>
+                        Align the 17-digit VIN code within the green box and click scan.
+                    </p>
+                </div>
+            );
+        };
+
+        const VisualDamageMapper = ({ damages, onAddDamage, readOnly }) => {
+            const handleImageClick = (e) => {
+                if (readOnly) return;
+                const rect = e.currentTarget.getBoundingClientRect();
+                const x = ((e.clientX - rect.left) / rect.width) * 100;
+                const y = ((e.clientY - rect.top) / rect.height) * 100;
+
+                const type = prompt("Damage Type (Scratch, Dent, Broken, Other):", "Scratch");
+                if (type) {
+                    onAddDamage({
+                        type,
+                        notes: '',
+                        coords: { x, y, view: 'Full Schematic' }
+                    });
+                }
+            };
+
+            return (
+                <div className="card animate-fade-in">
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                        <h3>Visual Damage Inspector</h3>
+                        <span style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>Click exactly on the schematic below to mark damage.</span>
+                    </div>
+
+                    <div
+                        id="visual-damage-map-capture"
+                        style={{
+                            position: 'relative',
+                            border: '1px solid #e2e8f0',
+                            borderRadius: '8px',
+                            background: 'white',
+                            padding: '1rem',
+                            height: '550px',
+                            cursor: readOnly ? 'default' : 'crosshair',
+                            overflow: 'hidden',
+                            userSelect: 'none',
+                            display: 'flex',
+                            justifyContent: 'center',
+                            alignItems: 'center'
+                        }}
+                        onClick={handleImageClick}
+                    >
+                        <div className="vehicle-blueprint-container" style={{ width: '100%', height: '100%', position: 'relative' }}>
+                            <img
+                                src="./car_schema.png"
+                                className="vehicle-blueprint-img"
+                                alt="Car Schematic"
+                                style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+                            />
+
+                            {/* Render Markers */}
+                            {damages.map((d, i) => (
+                                <div
+                                    key={i}
+                                    style={{
+                                        position: 'absolute',
+                                        left: `${d.coords.x}%`,
+                                        top: `${d.coords.y}%`,
+                                        width: '16px',
+                                        height: '16px',
+                                        background: 'rgba(239, 68, 68, 0.9)',
+                                        border: '2px solid white',
+                                        borderRadius: '50%',
+                                        transform: 'translate(-50%, -50%)',
+                                        boxShadow: '0 0 4px rgba(0,0,0,0.4)',
+                                        pointerEvents: 'none',
+                                        zIndex: 10,
+                                        display: 'flex',
+                                        alignItems: 'center',
+                                        justifyContent: 'center',
+                                        color: 'white',
+                                        fontSize: '10px',
+                                        fontWeight: 'bold'
+                                    }}
+                                >
+                                    {i + 1}
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const VehicleInfoSection = ({ data, onChange, readOnly }) => {
+            const [scanning, setScanning] = useState(false);
+            const [decoding, setDecoding] = useState(false);
+
+            const handleVinScan = async (scannedVin) => {
+                setScanning(false);
+                onChange('vin', scannedVin);
+                handleVinDecode(scannedVin);
+            };
+
+            const handleVinDecode = async (vinToDecode) => {
+                if (!vinToDecode || vinToDecode.length < 17) {
+                    alert("Please enter a full 17-digit VIN to decode.");
+                    return;
+                }
+                setDecoding(true);
+                const info = await db.decodeVin(vinToDecode);
+                if (info.success) {
+                    onChange('year', info.year);
+                    onChange('make', info.make);
+                    onChange('model', info.model);
+                } else {
+                    alert("Could not automatically decode this VIN. Please fill in manually.");
+                }
+                setDecoding(false);
+            };
+
+            return (
+                <div className="card animate-fade-in">
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                        <h3>Vehicle Information</h3>
+                        {!readOnly && (
+                            <button
+                                type="button"
+                                className="btn btn-outline"
+                                style={{ width: 'auto', padding: '0.4rem 0.8rem', fontSize: '0.8rem', borderColor: 'var(--primary)', color: 'var(--primary)' }}
+                                onClick={() => setScanning(true)}
+                            >
+                                📷 Scan VIN
+                            </button>
+                        )}
+                    </div>
+
+                    {scanning && <VinScanner onScan={handleVinScan} onClose={() => setScanning(false)} />}
+
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginTop: '1rem' }}>
+                        <div style={{ gridColumn: 'span 2', position: 'relative' }}>
+                            <label>Full VIN (17 digits)</label>
+                            <div style={{ display: 'flex', gap: '0.5rem' }}>
+                                <input
+                                    disabled={readOnly}
+                                    className="input"
+                                    value={data.vin || ''}
+                                    onChange={e => onChange('vin', e.target.value.toUpperCase())}
+                                    placeholder="Enter or scan VIN"
+                                />
+                                {!readOnly && (
+                                    <button
+                                        type="button"
+                                        className="btn btn-primary"
+                                        style={{ width: 'auto', padding: '0 1rem' }}
+                                        onClick={() => handleVinDecode(data.vin)}
+                                        disabled={decoding}
+                                    >
+                                        {decoding ? '...' : 'Decode'}
+                                    </button>
+                                )}
+                            </div>
+                        </div>
+                        <div>
+                            <label>Unit Number</label>
+                            <input disabled={readOnly} className="input" value={data.unitC || ''} onChange={e => onChange('unitC', e.target.value)} placeholder="#" />
+                        </div>
+                        <div>
+                            <label>Year</label>
+                            <input disabled={readOnly} type="number" className="input" value={data.year || ''} onChange={e => onChange('year', e.target.value)} placeholder="Auto-filled" />
+                        </div>
+                        <div>
+                            <label>Make</label>
+                            <input disabled={readOnly} className="input" value={data.make || ''} onChange={e => onChange('make', e.target.value)} placeholder="Auto-filled" />
+                        </div>
+                        <div>
+                            <label>Model</label>
+                            <input disabled={readOnly} className="input" value={data.model || ''} onChange={e => onChange('model', e.target.value)} placeholder="Auto-filled" />
+                        </div>
+                        <div>
+                            <label>Color</label>
+                            <input disabled={readOnly} className="input" value={data.color || ''} onChange={e => onChange('color', e.target.value)} placeholder="Silver" />
+                        </div>
+                        <div>
+                            <label>Mileage</label>
+                            <input disabled={readOnly} type="number" className="input" value={data.mileage || ''} onChange={e => onChange('mileage', e.target.value)} placeholder="15000" />
+                        </div>
+                        <div>
+                            <label>Gas Level</label>
+                            <select disabled={readOnly} className="select" value={data.gasLevel || ''} onChange={e => onChange('gasLevel', e.target.value)}>
+                                <option value="">Select...</option>
+                                <option value="E">Empty</option>
+                                <option value="1/4">1/4</option>
+                                <option value="1/2">1/2</option>
+                                <option value="3/4">3/4</option>
+                                <option value="F">Full</option>
+                            </select>
+                        </div>
+                        <div style={{ gridColumn: 'span 2' }}>
+                            <label>Checked In By</label>
+                            <input disabled={readOnly} className="input" value={data.checkedInBy || ''} onChange={e => onChange('checkedInBy', e.target.value)} placeholder="Employee Name" />
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const ToggleQuestion = ({ label, value, onChange, readOnly }) => (
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '0.75rem 0', borderBottom: '1px solid #f1f5f9' }}>
+                <span style={{ fontWeight: 500 }}>{label}</span>
+                <div style={{ display: 'flex', gap: '0.5rem' }}>
+                    <button
+                        type="button"
+                        disabled={readOnly}
+                        style={{
+                            padding: '0.4rem 1rem',
+                            borderRadius: '20px',
+                            border: '1px solid #e2e8f0',
+                            background: value === true ? 'var(--success)' : (readOnly ? '#f1f5f9' : 'white'),
+                            color: value === true ? 'white' : 'var(--text-main)',
+                            opacity: readOnly && value !== true ? 0.5 : 1,
+                            cursor: readOnly ? 'default' : 'pointer'
+                        }}
+                        onClick={() => !readOnly && onChange(true)}
+                    >
+                        Yes
+                    </button>
+                    <button
+                        type="button"
+                        disabled={readOnly}
+                        style={{
+                            padding: '0.4rem 1rem',
+                            borderRadius: '20px',
+                            border: '1px solid #e2e8f0',
+                            background: value === false ? 'var(--danger)' : (readOnly ? '#f1f5f9' : 'white'),
+                            color: value === false ? 'white' : 'var(--text-main)',
+                            opacity: readOnly && value !== false ? 0.5 : 1,
+                            cursor: readOnly ? 'default' : 'pointer'
+                        }}
+                        onClick={() => !readOnly && onChange(false)}
+                    >
+                        No
+                    </button>
+                </div>
+            </div>
+        );
+
+        const ConditionSection = ({ data, onChange, readOnly }) => {
+            const questions = [
+                { key: 'ac', label: 'A/C' },
+                { key: 'moonroof', label: 'Moon Roof' },
+                { key: 'vents', label: 'Vents' },
+                { key: 'backupCamera', label: 'Back up Camera' },
+                { key: 'powerSeats', label: 'Power seats' },
+                { key: 'wipers', label: 'Wipers' },
+                { key: 'glassChipCrack', label: 'Glass Chip/Crack' },
+                { key: 'radio', label: 'Radio' },
+                { key: 'windows', label: 'Windows' },
+                { key: 'headlights', label: 'Headlights' },
+                { key: 'taillights', label: 'Taillights' },
+                { key: 'eam', label: 'EAM' },
+                { key: 'inWheels', label: 'In wheels' },
+                { key: 'keyInspection', label: 'Key inspection' },
+                { key: 'floorMats', label: 'Floor mats' },
+                { key: 'spareTire', label: 'Spare tire' },
+                { key: 'tireJack', label: 'Tire Jack' },
+            ];
+
+            return (
+                <div className="card animate-fade-in">
+                    <h3>Vehicle Condition</h3>
+                    {!readOnly && <p style={{ color: 'var(--text-muted)', fontSize: '0.9rem', marginBottom: '1rem' }}>Tap Yes or No for each item.</p>}
+                    <div>
+                        {questions.map(q => (
+                            <ToggleQuestion
+                                key={q.key}
+                                label={q.label}
+                                value={data[q.key]}
+                                onChange={(val) => onChange(q.key, val)}
+                                readOnly={readOnly}
+                            />
+                        ))}
+                    </div>
+                </div>
+            );
+        };
+
+        const DamageSection = ({ damages, onAdd, onRemove, onUpdate, readOnly }) => (
+            <div className="card animate-fade-in">
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1rem' }}>
+                    <h3>Damage Report</h3>
+                    {/* Visual Mapper handles addition too, but we keep this for manual list entry if needed, or hide it if visual is primary */}
+                    {!readOnly && <button type="button" className="btn btn-outline" style={{ width: 'auto', padding: '0.4rem 0.8rem' }} onClick={onAdd}>+ Add List Item</button>}
+                </div>
+
+                {damages.length === 0 && <p style={{ color: 'var(--text-muted)' }}>No damage reported.</p>}
+
+                {damages.map((d, idx) => (
+                    <div key={idx} style={{ background: 'var(--bg-input)', padding: '1rem', borderRadius: '8px', marginBottom: '1rem' }}>
+                        <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: '0.5rem' }}>
+                            <span style={{ fontWeight: 600 }}>Damage #{idx + 1} {d.coords ? `(${d.coords.view})` : ''}</span>
+                            {!readOnly && <button type="button" onClick={() => onRemove(idx)} style={{ color: 'var(--danger)', background: 'none', border: 'none', cursor: 'pointer' }}>Remove</button>}
+                        </div>
+
+                        <select disabled={readOnly} className="select" value={d.type} onChange={(e) => onUpdate(idx, 'type', e.target.value)}>
+                            <option value="">Select Type...</option>
+                            <option value="Scratch">Scratch</option>
+                            <option value="Dent">Dent</option>
+                            <option value="Broken">Broken</option>
+                            <option value="Other">Other</option>
+                        </select>
+
+                        <input
+                            disabled={readOnly}
+                            className="input"
+                            placeholder="Notes (e.g. Front bumper, passenger side)"
+                            value={d.notes}
+                            onChange={(e) => onUpdate(idx, 'notes', e.target.value)}
+                        />
+                    </div>
+                ))}
+            </div>
+        );
+
+        const PhotosSection = ({ photos, onAdd, onRemove, readOnly }) => {
+            const handleFileChange = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                const reader = new FileReader();
+                reader.readAsDataURL(file);
+                reader.onload = () => {
+                    onAdd({ name: file.name, url: reader.result });
+                };
+                reader.onerror = (error) => console.error('Error: ', error);
+
+                // Clear input so same file can be selected again
+                e.target.value = '';
+            };
+
+            return (
+                <div className="card animate-fade-in">
+                    <h3>Damage Photos</h3>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '1rem', marginTop: '1rem' }}>
+                        {photos.map((p, i) => (
+                            <div key={i} style={{
+                                position: 'relative',
+                                width: '100px',
+                                height: '100px',
+                                background: '#f1f5f9',
+                                borderRadius: '4px',
+                                overflow: 'hidden',
+                                border: '1px solid #e2e8f0'
+                            }}>
+                                {/* Preview Image */}
+                                {p.url && <img src={p.url} alt={p.name} style={{ width: '100%', height: '100%', objectFit: 'cover' }} />}
+                                {!readOnly && (
+                                    <button
+                                        onClick={() => onRemove(i)}
+                                        style={{
+                                            position: 'absolute',
+                                            top: '2px',
+                                            right: '2px',
+                                            background: 'rgba(0,0,0,0.5)',
+                                            color: 'white',
+                                            border: 'none',
+                                            borderRadius: '50%',
+                                            width: '20px',
+                                            height: '20px',
+                                            cursor: 'pointer',
+                                            fontSize: '12px',
+                                            display: 'flex',
+                                            alignItems: 'center',
+                                            justifyContent: 'center'
+                                        }}
+                                    >×</button>
+                                )}
+                                <div style={{ position: 'absolute', bottom: 0, left: 0, right: 0, background: 'rgba(0,0,0,0.6)', color: 'white', fontSize: '10px', padding: '2px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                                    {p.name}
+                                </div>
+                            </div>
+                        ))}
+                        {photos.length === 0 && <span style={{ color: 'var(--text-muted)' }}>No photos attached.</span>}
+                    </div>
+                    {!readOnly && (
+                        <div style={{ marginTop: '1rem' }}>
+                            <input
+                                type="file"
+                                accept="image/*"
+                                id="photo-upload"
+                                style={{ display: 'none' }}
+                                onChange={handleFileChange}
+                            />
+                            <button
+                                type="button"
+                                className="btn btn-outline"
+                                onClick={() => document.getElementById('photo-upload').click()}
+                            >
+                                + Attach Photo (Camera/File)
+                            </button>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        const TireDepthSection = ({ data, onChange, readOnly }) => (
+            <div className="card animate-fade-in">
+                <h3>Tire Depth (32nds)</h3>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem', marginTop: '1rem' }}>
+                    <div>
+                        <label>Front Left</label>
+                        <input disabled={readOnly} type="number" className="input" value={data.fl || ''} onChange={e => onChange('fl', e.target.value)} placeholder="8/32" />
+                    </div>
+                    <div>
+                        <label>Front Right</label>
+                        <input disabled={readOnly} type="number" className="input" value={data.fr || ''} onChange={e => onChange('fr', e.target.value)} placeholder="8/32" />
+                    </div>
+                    <div>
+                        <label>Rear Left</label>
+                        <input disabled={readOnly} type="number" className="input" value={data.rl || ''} onChange={e => onChange('rl', e.target.value)} placeholder="8/32" />
+                    </div>
+                    <div>
+                        <label>Rear Right</label>
+                        <input disabled={readOnly} type="number" className="input" value={data.rr || ''} onChange={e => onChange('rr', e.target.value)} placeholder="8/32" />
+                    </div>
+                </div>
+            </div>
+        );
+
+        const InspectionForm = ({ onSuccess, initialData, readOnly = false }) => {
+            const [submitting, setSubmitting] = useState(false);
+            const [vehicle, setVehicle] = useState(initialData?.vehicleDetails || {});
+            const [condition, setCondition] = useState(initialData?.condition || {});
+            const [tireDepth, setTireDepth] = useState(initialData?.tireDepth || {});
+            const [damages, setDamages] = useState(initialData?.damages || []);
+            const [photos, setPhotos] = useState(initialData?.photos || []);
+            const [notes, setNotes] = useState(initialData?.notes || '');
+
+            useEffect(() => {
+                if (initialData) {
+                    setVehicle(initialData.vehicleDetails || {});
+                    setCondition(initialData.condition || {});
+                    setTireDepth(initialData.tireDepth || {});
+                    setDamages(initialData.damages || []);
+                    setPhotos(initialData.photos || []);
+                    setNotes(initialData.notes || '');
+                }
+            }, [initialData]);
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                setSubmitting(true);
+                try {
+                    await db.saveInspection({
+                        vehicleDetails: vehicle,
+                        condition,
+                        tireDepth,
+                        damages,
+                        photos,
+                        notes
+                    });
+                    alert('Inspection Saved Successfully!');
+                    if (onSuccess) onSuccess();
+                } catch (err) {
+                    console.error(err);
+                    alert('Error saving inspection');
+                } finally {
+                    setSubmitting(false);
+                }
+            };
+
+            return (
+                <form onSubmit={handleSubmit} className="container" style={{ paddingBottom: '3rem' }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
+                        <h1>{readOnly ? 'View Inspection' : 'New Inspection'}</h1>
+                        {readOnly && (
+                            <button type="button" className="btn btn-outline" style={{ width: 'auto' }} onClick={() => generateInspectionPDF({ ...initialData, vehicleDetails: vehicle, condition, tireDepth, damages, notes })}>
+                                Download PDF
+                            </button>
+                        )}
+                    </div>
+
+                    <VehicleInfoSection
+                        data={vehicle}
+                        onChange={(k, v) => setVehicle(prev => ({ ...prev, [k]: v }))}
+                        readOnly={readOnly}
+                    />
+
+                    <PhotosSection
+                        photos={photos}
+                        onAdd={(p) => setPhotos(prev => [...prev, p])}
+                        onRemove={(i) => setPhotos(prev => prev.filter((_, idx) => idx !== i))}
+                        readOnly={readOnly}
+                    />
+
+                    <ConditionSection
+                        data={condition}
+                        onChange={(k, v) => setCondition(prev => ({ ...prev, [k]: v }))}
+                        readOnly={readOnly}
+                    />
+
+                    <TireDepthSection
+                        data={tireDepth}
+                        onChange={(k, v) => setTireDepth(prev => ({ ...prev, [k]: v }))}
+                        readOnly={readOnly}
+                    />
+
+                    <VisualDamageMapper
+                        damages={damages}
+                        onAddDamage={(d) => setDamages(prev => [...prev, d])}
+                        readOnly={readOnly}
+                    />
+
+                    <DamageSection
+                        damages={damages}
+                        onAdd={() => setDamages(prev => [...prev, { type: '', notes: '' }])}
+                        onRemove={(idx) => setDamages(prev => prev.filter((_, i) => i !== idx))}
+                        onUpdate={(idx, field, val) => {
+                            const newD = [...damages];
+                            newD[idx][field] = val;
+                            setDamages(newD);
+                        }}
+                        readOnly={readOnly}
+                    />
+
+                    <div className="card">
+                        <h3>Additional Notes</h3>
+                        <textarea
+                            disabled={readOnly}
+                            className="input"
+                            rows="3"
+                            value={notes}
+                            onChange={e => setNotes(e.target.value)}
+                        />
+                    </div>
+
+                    {!readOnly && (
+                        <button type="submit" className="btn btn-primary" disabled={submitting}>
+                            {submitting ? 'Saving...' : 'Submit Inspection'}
+                        </button>
+                    )}
+                    {readOnly && (
+                        <button type="button" className="btn btn-outline" onClick={onSuccess}>
+                            Back to Dashboard
+                        </button>
+                    )}
+                </form>
+            );
+        };
+
+        const InspectionList = () => {
+            const [inspections, setInspections] = useState([]);
+            const [loading, setLoading] = useState(true);
+            const [search, setSearch] = useState('');
+
+            useEffect(() => {
+                loadData();
+            }, []);
+
+            const loadData = async () => {
+                const data = await db.getInspections();
+                setInspections(data);
+                setLoading(false);
+            };
+
+            const filtered = inspections.filter(i =>
+                search === '' ||
+                i.vehicleDetails.vin?.toLowerCase().includes(search.toLowerCase()) ||
+                i.vehicleDetails.make.toLowerCase().includes(search.toLowerCase()) ||
+                i.vehicleDetails.model.toLowerCase().includes(search.toLowerCase())
+            );
+
+            if (loading) return <div style={{ textAlign: 'center', padding: '2rem' }}>Loading recent inspections...</div>;
+
+            return (
+                <div style={{ display: 'grid', gap: '0.75rem' }}>
+                    <div style={{ marginBottom: '0.5rem' }}>
+                        <input
+                            className="input"
+                            placeholder="Search by VIN, Make, or Model..."
+                            value={search}
+                            onChange={(e) => setSearch(e.target.value)}
+                            style={{ marginBottom: '0.5rem' }}
+                        />
+                    </div>
+
+                    {filtered.length === 0 && <div style={{ textAlign: 'center', color: '#64748b' }}>No inspections found.</div>}
+
+                    {filtered.map(i => (
+                        <div key={i.id}
+                            onClick={() => window.location.hash = `#view-inspection/${i.id}`}
+                            style={{
+                                padding: '1rem',
+                                background: 'white',
+                                border: '1px solid #e2e8f0',
+                                borderRadius: '8px',
+                                display: 'flex',
+                                justifyContent: 'space-between',
+                                alignItems: 'center',
+                                cursor: 'pointer',
+                                transition: 'box-shadow 0.2s'
+                            }}
+                            onMouseEnter={e => e.currentTarget.style.boxShadow = '0 2px 4px rgba(0,0,0,0.05)'}
+                            onMouseLeave={e => e.currentTarget.style.boxShadow = 'none'}
+                        >
+                            <div>
+                                <div style={{ fontWeight: 600 }}>{i.vehicleDetails.year} {i.vehicleDetails.make} {i.vehicleDetails.model}</div>
+                                <div style={{ fontSize: '0.85rem', color: '#64748b' }}>VIN: ...{i.vehicleDetails.vin?.slice(-8) || 'N/A'} • {i.status}</div>
+                            </div>
+                            <div>
+                                <span style={{
+                                    fontSize: '0.75rem',
+                                    padding: '2px 8px',
+                                    borderRadius: '12px',
+                                    background: '#f1f5f9',
+                                    color: '#475569'
+                                }}>
+                                    {new Date(i.createdAt).toLocaleDateString()}
+                                </span>
+                            </div>
+                        </div>
+                    ))}
+                </div>
+            );
+        };
+
+        const ApprovalForm = ({ onSuccess }) => {
+            const [inspections, setInspections] = useState([]);
+            const [step, setStep] = useState(1);
+            const [selectedId, setSelectedId] = useState(null);
+            const [recipient, setRecipient] = useState('');
+            const [files, setFiles] = useState([]);
+
+            useEffect(() => {
+                db.getInspections().then(data => {
+                    setInspections(data);
+                });
+            }, []);
+
+            const handleFileAdd = () => {
+                const name = prompt("Enter mock file name (e.g. photo.jpg)");
+                if (name) setFiles(prev => [...prev, name]);
+            };
+
+            const handleSubmit = async (e) => {
+                e.preventDefault();
+                if (!selectedId || !recipient) return;
+
+                try {
+                    await db.createApprovalRequest(selectedId, {
+                        recipient,
+                        files
+                    });
+                    alert(`Approval Request Sent to ${recipient}!`);
+                    if (onSuccess) onSuccess();
+                } catch (err) {
+                    console.error(err);
+                    alert('Error sending request');
+                }
+            };
+
+            if (step === 1) {
+                return (
+                    <div className="container animate-fade-in">
+                        <h1>Request Approval</h1>
+                        <p>Select a vehicle inspection to submit for approval:</p>
+                        <div style={{ marginTop: '1rem', display: 'grid', gap: '0.5rem' }}>
+                            {inspections.length === 0 && <p>No inspections found.</p>}
+                            {inspections.map(i => (
+                                <div
+                                    key={i.id}
+                                    onClick={() => { setSelectedId(i.id); setStep(2); }}
+                                    style={{
+                                        padding: '1rem',
+                                        border: '1px solid #e2e8f0',
+                                        borderRadius: '8px',
+                                        background: 'white',
+                                        cursor: 'pointer'
+                                    }}
+                                >
+                                    <strong>{i.vehicleDetails.year} {i.vehicleDetails.make} {i.vehicleDetails.model}</strong>
+                                    <div style={{ fontSize: '0.85rem', color: '#64748b' }}>VIN: ...{i.vehicleDetails.vin?.slice(-8)}</div>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                );
+            }
+
+            const selectedInspection = inspections.find(i => i.id === selectedId);
+
+            return (
+                <form onSubmit={handleSubmit} className="container animate-fade-in">
+                    <h1>Approval Details</h1>
+                    <div className="card">
+                        <h3>Vehicle: {selectedInspection?.vehicleDetails.year} {selectedInspection?.vehicleDetails.model}</h3>
+                        <p style={{ color: '#64748b', fontSize: '0.9rem' }}>VIN: {selectedInspection?.vehicleDetails.vin}</p>
+                    </div>
+
+                    <div className="card">
+                        <label>Recipient (Internal)</label>
+                        <select className="select" required value={recipient} onChange={e => setRecipient(e.target.value)}>
+                            <option value="">Select Manager...</option>
+                            <option value="manager@dealership.com">General Manager</option>
+                            <option value="service@dealership.com">Service Director</option>
+                            <option value="sales@dealership.com">Sales Manager</option>
+                        </select>
+
+                        <div style={{ marginTop: '1rem' }}>
+                            <label>Attachments (Photos/Docs)</label>
+                            <div style={{ marginBottom: '0.5rem' }}>
+                                {files.map((f, i) => (
+                                    <div key={i} style={{ padding: '0.5rem', background: '#f1f5f9', marginBottom: '0.25rem', borderRadius: '4px', fontSize: '0.9rem' }}>📎 {f}</div>
+                                ))}
+                            </div>
+                            <button type="button" className="btn btn-outline" onClick={handleFileAdd}>+ Attach Mock File</button>
+                            <p style={{ fontSize: '0.8rem', color: '#94a3b8', marginTop: '0.25rem' }}>* In real app, this opens file picker.</p>
+                        </div>
+                    </div>
+
+                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '1rem' }}>
+                        <button type="button" className="btn btn-outline" onClick={() => setStep(1)}>Back</button>
+                        <button type="submit" className="btn btn-primary">Send Request</button>
+                    </div>
+                </form>
+            );
+        };
+
+        const Layout = ({ children }) => {
+            return (
+                <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
+                    <header style={{
+                        padding: '1rem',
+                        background: 'var(--primary)',
+                        color: 'white',
+                        borderBottom: '1px solid #e2e8f0',
+                        display: 'flex',
+                        justifyContent: 'space-between',
+                        alignItems: 'center',
+                        boxShadow: 'var(--shadow-sm)'
+                    }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }} onClick={() => window.location.hash = ''}>
+                            <h3 style={{ margin: 0, color: 'white' }}>CarInspect</h3>
+                        </div>
+                        <span style={{ fontSize: '0.8rem', opacity: 0.8 }}>Internal Beta</span>
+                    </header>
+                    <main style={{ flex: 1, padding: '1rem' }}>
+                        {children}
+                    </main>
+                </div>
+            );
+        };
+
+        const Dashboard = () => {
+            return (
+                <div className="container animate-fade-in">
+                    <h1 style={{ margin: '1rem 0 2rem' }}>Dashboard</h1>
+
+                    <div style={{ display: 'grid', gap: '1rem', marginBottom: '2rem' }}>
+                        <button className="btn btn-primary" onClick={() => window.location.hash = '#new-inspection'} style={{ justifyContent: 'center', fontSize: '1.1rem', padding: '1rem' }}>
+                            + Start New Inspection
+                        </button>
+                        <button className="btn btn-outline" onClick={() => window.location.hash = '#approvals'} style={{ justifyContent: 'center' }}>
+                            Request Approval
+                        </button>
+                    </div>
+
+                    <h3 style={{ marginBottom: '1rem' }}>Recent Inspections</h3>
+                    <div className="card" style={{ padding: '0.5rem' }}>
+                        <InspectionList />
+                    </div>
+                </div>
+            );
+        };
+
+        const App = () => {
+            const [route, setRoute] = useState(window.location.hash || '#dashboard');
+            const [viewData, setViewData] = useState(null);
+
+            useEffect(() => {
+                const handleHashChange = async () => {
+                    const hash = window.location.hash || '#dashboard';
+                    setRoute(hash);
+
+                    if (hash.startsWith('#view-inspection/')) {
+                        const id = hash.split('/')[1];
+                        const inspections = await db.getInspections();
+                        const found = inspections.find(i => i.id === id);
+                        setViewData(found);
+                    }
+                };
+
+                window.addEventListener('hashchange', handleHashChange);
+                handleHashChange();
+
+                return () => window.removeEventListener('hashchange', handleHashChange);
+            }, []);
+
+            const goHome = () => window.location.hash = '#dashboard';
+
+            let Component;
+            if (route === '#new-inspection') {
+                Component = () => <InspectionForm onSuccess={goHome} />;
+            } else if (route === '#approvals') {
+                Component = () => <ApprovalForm onSuccess={goHome} />;
+            } else if (route.startsWith('#view-inspection/')) {
+                Component = () => viewData ? (
+                    <InspectionForm
+                        initialData={viewData}
+                        readOnly={true}
+                        onSuccess={goHome}
+                    />
+                ) : <div className="container">Loading...</div>;
+            } else {
+                Component = Dashboard;
+            }
+
+            return (
+                <Layout>
+                    <Component />
+                </Layout>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+
+</html>

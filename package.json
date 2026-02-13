@@ -1,0 +1,13 @@
+{
+  "name": "car-inspection-app",
+  "version": "1.0.0",
+  "description": "Car inspection application with PDF export",
+  "main": "index.html",
+  "scripts": {
+    "start": "serve ."
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {}
+}
