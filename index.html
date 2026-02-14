@@ -87,6 +87,7 @@
 
             async saveInspection(inspection) {
                 try {
+                    const selectedStore = localStorage.getItem('car_inspect_store');
                     const { data, error } = await supabaseClient
                         .from('inspecciones')
                         .insert([{
@@ -97,7 +98,8 @@
                             damages: inspection.damages,
                             fotos: inspection.photos,
                             notes: inspection.notes,
-                            usuario_nombre: inspection.vehicleDetails.checkedInBy
+                            usuario_nombre: inspection.vehicleDetails.checkedInBy,
+                            tienda_nombre: selectedStore || 'General'
                         }])
                         .select();
 
@@ -987,7 +989,9 @@
                     if (err.name === 'QuotaExceededError' || err.message.includes('quota')) {
                         alert("ERROR: Storage is full! Your browser's local memory (localStorage) cannot hold more photos. Please delete old inspections or take fewer/lower quality photos.");
                     } else {
-                        alert('Error saving inspection: ' + err.message);
+                        // Detailed Supabase error
+                        const errorMsg = err.message || (err.error ? err.error.message : "Unknown error");
+                        alert('Error saving inspection: ' + errorMsg);
                     }
                 } finally {
                     setSubmitting(false);
@@ -1092,7 +1096,8 @@
                 search === '' ||
                 i.vehicleDetails.vin?.toLowerCase().includes(search.toLowerCase()) ||
                 i.vehicleDetails.make.toLowerCase().includes(search.toLowerCase()) ||
-                i.vehicleDetails.model.toLowerCase().includes(search.toLowerCase())
+                i.vehicleDetails.model.toLowerCase().includes(search.toLowerCase()) ||
+                (i.tienda_nombre && i.tienda_nombre.toLowerCase().includes(search.toLowerCase()))
             );
 
             if (loading) return <div style={{ textAlign: 'center', padding: '2rem' }}>Loading recent inspections...</div>;
@@ -1130,7 +1135,9 @@
                         >
                             <div>
                                 <div style={{ fontWeight: 600 }}>{i.vehicleDetails.year} {i.vehicleDetails.make} {i.vehicleDetails.model}</div>
-                                <div style={{ fontSize: '0.85rem', color: '#64748b' }}>VIN: ...{i.vehicleDetails.vin?.slice(-8) || 'N/A'} • {i.status}</div>
+                                <div style={{ fontSize: '0.85rem', color: '#64748b' }}>
+                                    <span style={{ color: 'var(--primary)', fontWeight: '600' }}>{i.tienda_nombre || 'General'}</span> • VIN: ...{i.vehicleDetails.vin?.slice(-8) || 'N/A'}
+                                </div>
                             </div>
                             <div>
                                 <span style={{
@@ -1276,6 +1283,31 @@
             );
         };
 
+        const SetupScreen = ({ onComplete }) => {
+            const [store, setStore] = useState('');
+            const stores = Array.from({ length: 40 }, (_, i) => `Store ${i + 1}`);
+
+            const handleSave = () => {
+                if (!store) return alert("Please select a store");
+                localStorage.setItem('car_inspect_store', store);
+                onComplete(store);
+            };
+
+            return (
+                <div className="container animate-fade-in" style={{ height: '80vh', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    <div className="card" style={{ maxWidth: '400px', width: '100%', textAlign: 'center' }}>
+                        <h2>App Setup</h2>
+                        <p style={{ color: 'var(--text-muted)', marginBottom: '1.5rem' }}>Select your store to begin</p>
+                        <select className="input" value={store} onChange={e => setStore(e.target.value)} style={{ marginBottom: '1.5rem' }}>
+                            <option value="">-- Select Store --</option>
+                            {stores.map(s => <option key={s} value={s}>{s}</option>)}
+                        </select>
+                        <button className="btn btn-primary" onClick={handleSave}>Continue</button>
+                    </div>
+                </div>
+            );
+        };
+
         const Dashboard = () => {
             return (
                 <div className="container animate-fade-in">
@@ -1304,6 +1336,7 @@
         const App = () => {
             const [route, setRoute] = useState(window.location.hash || '#dashboard');
             const [viewData, setViewData] = useState(null);
+            const [store, setStore] = useState(localStorage.getItem('car_inspect_store'));
 
             useEffect(() => {
                 const handleHashChange = async () => {
